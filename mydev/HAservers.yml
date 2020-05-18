@@ -1,0 +1,265 @@
+Description: >
+      Template for deploying simple infrastructure with LB, AutoScaling,  
+      Health check, SG, Listener and Target Group  for Udacity Project.
+
+Parameters:
+
+  EnvironmentName:
+      Description: An environment name that will be prefixed to resource names
+      Type: String
+
+  BastionKeyPair:
+    Description: Select the key pair for the Bastion host.
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: bastion-host
+
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: "ami-07ebfd5b3428b6f4d"
+
+
+Resources:
+
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: LBSecGroup
+
+
+  WebServerSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        SourceSecurityGroupId: !GetAtt BastionSGAllowSSH.GroupId
+      Tags:
+      - Key: Name
+        Value: WebServerSecGroup
+
+
+
+  BastionSGAllowSSH:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH to Bastion host
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+      - Key: Name
+        Value: BastionSGAllowSSH
+
+
+
+
+  # bastion host
+  BastionHostInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      KeyName: !Ref BastionKeyPair #bastion-host
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: t3a.micro
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: 10
+      Monitoring: false
+      # SubnetId: !Ref PublicSubnet1
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          DeviceIndex: "0"
+          GroupSet:
+            - !Ref BastionSGAllowSSH
+          SubnetId:
+            Fn::ImportValue:
+              Fn::Sub: "${EnvironmentName}-PUB1-SN"
+
+      # SecurityGroupIds:
+      #   - !Ref BastionSGAllowSSH
+      Tags:
+        - Key: Name
+          Value: Bastion-Host
+
+
+
+
+
+  # # launch config
+  WebSeverLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      LaunchConfigurationName: WebSeverLaunchConfig
+      # AssociatePublicIpAddress: true
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      # EbsOptimized: true|false
+      # InstanceMonitoring: true|false
+      InstanceType: t3a.nano
+      # KeyName: !Ref WebServerKeyPair #cfn-infra-udacity
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      BlockDeviceMappings:
+        - DeviceName: "/dev/sda1"
+          Ebs:
+            VolumeSize: '10'
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          apt update -y
+          apt install -y apache2
+          cd /var/www/html
+          echo "hello Annant" > index.html
+
+  # autoscaling group
+  WebAutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: WebAutoScalingGroup
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+
+      # AvailabilityZones:
+      #   - !Select
+      #     - 0
+      #     - Fn::GetAZs: !Ref "AWS::Region"
+      #   - !Select
+      #     - 1
+      #     - Fn::GetAZs: !Ref "AWS::Region"
+
+        # - "us-east-1a"
+        # - "us-east-1b"
+
+      DesiredCapacity: "2"
+      MaxSize: "4" #required
+      MinSize: "2" #required
+
+      HealthCheckGracePeriod: 30
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref WebSeverLaunchConfig
+      # NotificationConfigurations:
+      #   - NotificationConfiguration
+      Tags:
+        - Key: Environment
+          Value: Production
+          PropagateAtLaunch: true
+        - Key: Name
+          Value: WebServerGroup
+          PropagateAtLaunch: false
+      TargetGroupARNs:
+        - !Ref WebALBTargetGroup
+
+
+  WebServerALB:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Type: application
+      IpAddressType: ipv4
+      Name: WebServerALB
+      Scheme: internet-facing
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+      Tags:
+        - Key: Name
+          Value: WebServerALB
+
+
+  WebELBListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      DefaultActions: #required
+        - Type: "forward"
+          TargetGroupArn: !Ref WebALBTargetGroup
+      LoadBalancerArn: !Ref WebServerALB #required
+      Port: '80' #required
+      Protocol: "HTTP" #required
+
+
+
+  WebALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebALBTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'WebELBListener'
+        Priority: 1
+
+
+  WebALBTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: traffic-port
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
+      Name: WebALBTargetGroup
+      Port: 80
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: WebALBTargetGroup
+      TargetType: instance
+      UnhealthyThresholdCount: 2
+      VpcId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+
+
+
+Outputs:
+  LoadBalancerDNS:
+    Description: Displays the DNS of load balancer.
+    Value: !GetAtt WebServerALB.DNSName
+
+  BastionDNS:
+    Description: DNS of bastion Host for SSH.
+    Value: !GetAtt BastionHostInstance.PublicDnsName
+
+  BastionKeyName:
+    Description: SSH key to use for bastion Host.
+    Value: !Ref BastionKeyPair
